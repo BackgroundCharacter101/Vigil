@@ -1,0 +1,44 @@
+# Vigil requirements (webcam-aware auto-lock for Windows)
+# Target: Python 3.12 on Windows x64
+#
+# Uses InsightFace (RetinaFace + ArcFace) for detection and recognition.
+# Chosen over face_recognition/dlib because it handles profile and angled
+# views — important for users whose laptop webcam doesn't face them
+# head-on (e.g. laptop off to the side of a main monitor).
+#
+# First run downloads ~280MB of ONNX models to ~/.insightface/models/.
+
+# Face detection (RetinaFace) + recognition (ArcFace / buffalo_l).
+insightface==0.7.3
+
+# ONNX runtime backend for InsightFace.
+onnxruntime==1.24.4
+
+# Webcam capture.
+# NOTE: insightface transitively pulls in `opencv-python-headless`, which
+# is the same cv2 package but built without highgui (cv2.imshow /
+# namedWindow are missing). Installing both leaves whichever was
+# installed LAST, and pip resolution is non-deterministic. If you ever
+# see "cv2.error: The function is not implemented. Rebuild the library
+# with Windows...", run:
+#     pip uninstall -y opencv-python-headless
+#     pip install --force-reinstall --no-deps opencv-python==4.13.0.92
+opencv-python==4.13.0.92
+
+# Global hotkey listener (no admin required).
+pynput==1.8.1
+
+# System tray icon + menu.
+pystray==0.19.5
+Pillow==12.2.0
+
+# Windows COM bindings for Startup-folder .lnk creation (WScript.Shell).
+pywin32==311
+
+# Array math. Note: scipy, scikit-image, scikit-learn, albumentations etc.
+# are pulled in transitively by insightface — no need to pin them here.
+numpy==2.4.4
+
+# DirectShow camera enumeration — lets `enroll.py --list-cameras` show names.
+pygrabber==0.2
+

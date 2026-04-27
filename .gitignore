@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# Editors / IDEs
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# Logs (runtime data lives in %LOCALAPPDATA%\Vigil\, but catch stray logs)
+*.log
+
+# Claude Code per-machine settings (paths, host-specific permissions).
+.claude/settings.local.json
+
+# Reference face encodings (in case someone saves them into the repo folder
+# instead of %LOCALAPPDATA%\Vigil\). These are personal data — never commit.
+reference/
+known_face.npy
+known_face.npy.bak
