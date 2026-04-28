@@ -204,55 +204,88 @@ def ensure_icon_file() -> Path:
 # ---------------------------------------------------------------------------
 
 
-def _create_shortcut(target_lnk: Path, icon_file: Path) -> None:
+def _python_console_exe() -> Path:
+    """Resolve python.exe (the console-subsystem interpreter) for the
+    visible-launcher shortcuts. Sits next to pythonw.exe in the venv."""
+    py = Path(sys.executable)
+    candidate = py.with_name("python.exe")
+    if candidate.exists():
+        return candidate
+    return py
+
+
+def _create_shortcut(
+    target_lnk: Path,
+    icon_file: Path,
+    *,
+    visible: bool,
+) -> None:
     """Create (or overwrite) the .lnk at `target_lnk` pointing at the
     daemon entry point with `icon_file` as the icon.
 
+    `visible=True` shortcuts target `python.exe launcher.py` so the user
+    sees a console window confirming their click was received (used for
+    Desktop + Start-Menu, where invisible feedback is the killer UX
+    bug). `visible=False` targets `pythonw.exe main.py` directly with
+    no window (used for the Startup-folder shortcut, which fires
+    silently on login -- nobody wants a console window opening every
+    time they log in).
+
     Overwrites unconditionally -- if called with a fresh .ico or a moved
-    repo, the shortcut is corrected.
+    repo, the shortcut is corrected on the next ensure_installed() pass.
     """
     # Import pywin32 lazily so CI / lock.py smoke tests don't need it.
     from win32com.client import Dispatch  # type: ignore
 
-    main_py = Path(__file__).with_name("main.py").resolve()
-    work_dir = main_py.parent
-    pythonw = _pythonw_exe()
+    work_dir = Path(__file__).resolve().parent
+    if visible:
+        # User-clicked path: python.exe launcher.py -> shows a console
+        # countdown, spawns pythonw main.py detached, then closes itself.
+        py = _python_console_exe()
+        script = work_dir / "launcher.py"
+        # WindowStyle=1 (normal) -- we WANT the console visible.
+        window_style = 1
+    else:
+        # Background-autostart path: pythonw.exe main.py -> totally silent.
+        py = _pythonw_exe()
+        script = work_dir / "main.py"
+        # WindowStyle=7 (minimized) -- pythonw has no window anyway, but
+        # this keeps the .lnk's preferred-state metadata sane.
+        window_style = 7
 
     target_lnk.parent.mkdir(parents=True, exist_ok=True)
 
     shell = Dispatch("WScript.Shell")
     sc = shell.CreateShortCut(str(target_lnk))
-    sc.TargetPath = str(pythonw)
-    # Quote main.py's path to survive spaces in the repo path.
-    sc.Arguments = f'"{main_py}"'
+    sc.TargetPath = str(py)
+    sc.Arguments = f'"{script}"'
     sc.WorkingDirectory = str(work_dir)
-    # IconLocation accepts "path,index". Index 0 is the first icon in the .ico.
     sc.IconLocation = f"{icon_file},0"
     sc.Description = f"{config.APP_NAME} -- locks the PC when you leave the frame"
-    sc.WindowStyle = 7  # 7 = minimized; pythonw has no window, so this is harmless.
+    sc.WindowStyle = window_style
     sc.save()
 
 
 def install_startup_shortcut() -> Path:
-    """Install the Startup-folder shortcut (runs on login)."""
+    """Install the Startup-folder shortcut (runs SILENTLY on login)."""
     icon = ensure_icon_file()
     target = _startup_shortcut_path()
-    _create_shortcut(target, icon)
-    log.info("Installed Startup shortcut at %s", target)
+    _create_shortcut(target, icon, visible=False)
+    log.info("Installed Startup shortcut (silent) at %s", target)
     return target
 
 
 def install_start_menu_shortcut() -> Path:
-    """Install the Start Menu shortcut (visible in Start search)."""
+    """Install the Start Menu shortcut (visible launcher with console)."""
     icon = ensure_icon_file()
     target = _start_menu_shortcut_path()
-    _create_shortcut(target, icon)
-    log.info("Installed Start Menu shortcut at %s", target)
+    _create_shortcut(target, icon, visible=True)
+    log.info("Installed Start Menu shortcut (visible) at %s", target)
     return target
 
 
 def install_desktop_shortcut() -> Path:
-    """Install a shortcut on the user's Desktop.
+    """Install a shortcut on the user's Desktop (visible launcher).
 
     Why Desktop rather than programmatic Pin-to-Start/Pin-to-Taskbar?
     Microsoft has progressively locked down those APIs since Windows 10
@@ -261,11 +294,16 @@ def install_desktop_shortcut() -> Path:
     Desktop shortcut is reliable on every Windows version and the user
     can right-click -> Pin to Start / Pin to Taskbar in one gesture,
     using the exact mechanism Microsoft supports.
+
+    This shortcut targets the visible launcher (python.exe launcher.py)
+    not pythonw.exe main.py directly -- a Desktop-icon click that
+    produces zero visible feedback is the most common complaint when
+    the tray balloon path is intercepted on the user's machine.
     """
     icon = ensure_icon_file()
     target = _desktop_shortcut_path()
-    _create_shortcut(target, icon)
-    log.info("Installed Desktop shortcut at %s", target)
+    _create_shortcut(target, icon, visible=True)
+    log.info("Installed Desktop shortcut (visible) at %s", target)
     return target
 
 
@@ -432,12 +470,23 @@ def ensure_installed() -> None:
     nice-to-have, not a reason to block the daemon.
     """
     try:
+        # Startup shortcut: install only if missing (idempotent path).
+        # We don't re-write it every boot because the user MAY have
+        # disabled it via Task Manager -> Startup -> Disable, which
+        # writes a "user disabled this" marker into the StartupApproved
+        # registry key. Re-creating the .lnk would not undo that, but
+        # creating-on-missing avoids touching a deliberately-disabled
+        # entry.
         if not _startup_shortcut_path().exists():
             install_startup_shortcut()
-        if not _start_menu_shortcut_path().exists():
-            install_start_menu_shortcut()
-        if not _desktop_shortcut_path().exists():
-            install_desktop_shortcut()
+        # Desktop + Start-Menu shortcuts: ALWAYS re-install. These point
+        # at launcher.py (visible console window) rather than pythonw
+        # main.py directly, and existing pre-launcher installs need to
+        # be upgraded. Idempotent: WScript.Shell overwrites in-place
+        # with the corrected target. Cost is one COM call per boot --
+        # negligible.
+        install_desktop_shortcut()
+        install_start_menu_shortcut()
         # Always re-write the Run-key value: cheap, and self-heals if the
         # path got stale (e.g. venv rebuilt elsewhere). Reading-then-writing
         # only-on-change would save microseconds and add a branch.
