@@ -258,15 +258,203 @@ def main() -> int:
 
     print("  OK -- daemon is up and running.")
     print()
-    print("  Look for the green eye icon in your system tray.")
-    print("  (Click the ^ up-arrow in the notification area if hidden.)")
+    print("  Opening status window...")
     print()
-    print(f"  Logs:           {config.LOG_FILE}")
-    print(f"  Data folder:    {config.DATA_DIR}")
-    print(f"  Pause hotkey:   {config.PAUSE_HOTKEY}")
-    print()
-    _countdown(5)
+
+    # Show a real Tk window so the user has UNAMBIGUOUS visible feedback
+    # that "the program" is running. The tray icon is too easy to miss
+    # (Win11 hides it in the overflow flyout by default), and the user
+    # has reported "the program doesn't open" repeatedly because they
+    # were looking for a window. Now there IS one.
+    _show_status_window(daemon_pid=pid)
     return 0
+
+
+def _show_status_window(daemon_pid: int) -> None:
+    """Persistent Tk status panel. Closing it does NOT kill the daemon
+    (which is detached and runs independently in the background).
+
+    Why Tk and not pystray's tray balloon: pystray balloons + UWP toasts
+    + MessageBoxW are all silently swallowed on this user's machine by
+    some installed security/automation software. Tk creates a regular
+    top-level Win32 window which uses a completely different code path
+    that nothing intercepts -- if Win32 windows didn't render, Explorer
+    itself wouldn't render. So this is the one UI primitive guaranteed
+    to be visible.
+
+    Tk import is lazy (here, not at module top) so users who somehow
+    don't have tkinter still get the rest of the launcher functionality.
+    """
+    try:
+        import tkinter as tk
+        from tkinter import ttk
+    except Exception as e:
+        print(f"  (tkinter unavailable: {e}; skipping status window)")
+        _countdown(8)
+        return
+
+    root = tk.Tk()
+    root.title(f"{config.APP_NAME}")
+    # Reasonable default size; grows if the user resizes.
+    root.geometry("520x300")
+    # Always on top so it isn't lost behind the user's other windows
+    # right after launch -- they can always click off it later.
+    root.attributes("-topmost", True)
+    # Center on screen so it's obvious.
+    root.update_idletasks()
+    sw, sh = root.winfo_screenwidth(), root.winfo_screenheight()
+    w, h = 520, 300
+    root.geometry(f"{w}x{h}+{(sw-w)//2}+{(sh-h)//3}")
+
+    # Header.
+    header = tk.Label(
+        root,
+        text=f"{config.APP_NAME} is RUNNING",
+        font=("Segoe UI", 18, "bold"),
+        fg="#0a7a0a",
+        pady=12,
+    )
+    header.pack(fill="x")
+
+    sub = tk.Label(
+        root,
+        text=f"PID {daemon_pid}  -  watching the webcam in the background",
+        font=("Segoe UI", 9),
+        fg="#444",
+    )
+    sub.pack()
+
+    state_var = tk.StringVar(value="State: (loading...)")
+    state_label = tk.Label(
+        root,
+        textvariable=state_var,
+        font=("Segoe UI", 11),
+        pady=8,
+    )
+    state_label.pack(fill="x")
+
+    info = tk.Label(
+        root,
+        text=(
+            "Closing this window will NOT stop Vigil.\n"
+            "Vigil runs as a background tray icon. To stop it for real,\n"
+            "right-click the green eye in your system tray and choose Quit\n"
+            "(click the ^ up-arrow in the tray if you don't see it)."
+        ),
+        font=("Segoe UI", 9),
+        fg="#555",
+        justify="center",
+        pady=10,
+    )
+    info.pack(fill="x")
+
+    btn_frame = tk.Frame(root, pady=10)
+    btn_frame.pack()
+
+    def on_close():
+        root.destroy()
+
+    def on_quit_daemon():
+        # Kill pythonw via taskkill. This is the same effect as the tray
+        # menu Quit, but accessible from this window without hunting for
+        # the tray icon.
+        try:
+            subprocess.run(
+                ["taskkill", "/F", "/PID", str(daemon_pid)],
+                creationflags=_CREATE_NO_WINDOW,
+                timeout=5,
+                check=False,
+            )
+        except Exception:
+            pass
+        root.destroy()
+
+    close_btn = tk.Button(
+        btn_frame,
+        text="Hide this window  (Vigil keeps running)",
+        command=on_close,
+        width=42,
+    )
+    close_btn.pack(pady=4)
+
+    quit_btn = tk.Button(
+        btn_frame,
+        text="Quit Vigil",
+        command=on_quit_daemon,
+        width=42,
+        fg="#a00",
+    )
+    quit_btn.pack(pady=4)
+
+    # Periodic state refresh: tail the log every 1500ms and show the
+    # most recent State / Detection FPS / Lock trigger line so the
+    # window provides live feedback.
+    def refresh_state():
+        try:
+            tag = _latest_state_summary()
+            state_var.set(tag)
+        except Exception:
+            state_var.set("State: (could not read log)")
+        # Also stop polling if the daemon process has died.
+        if not _pid_alive(daemon_pid):
+            state_var.set("State: DAEMON HAS EXITED  (close this window)")
+            quit_btn.config(text="(daemon already gone)", state="disabled")
+            return
+        root.after(1500, refresh_state)
+
+    root.after(200, refresh_state)
+    # Releasing top-most after 3s so the user can put other windows over it.
+    root.after(3000, lambda: root.attributes("-topmost", False))
+
+    # Override the WM close button (X) to behave the same as Hide.
+    root.protocol("WM_DELETE_WINDOW", on_close)
+
+    root.mainloop()
+
+
+def _latest_state_summary() -> str:
+    """Read the tail of the log and return a one-line state summary."""
+    log_path = config.LOG_FILE
+    if not log_path.exists():
+        return "State: (no log file yet)"
+    try:
+        size = log_path.stat().st_size
+        with open(log_path, "rb") as f:
+            f.seek(max(0, size - 4096))
+            tail = f.read().decode("utf-8", errors="replace")
+    except OSError:
+        return "State: (could not read log)"
+    state = "?"
+    fps = "?"
+    last_trigger = ""
+    for line in tail.splitlines():
+        if "State:" in line and "->" in line:
+            # "State: STARTING -> WATCHING"
+            state = line.split("State:")[-1].split("->")[-1].strip()
+        elif "Detection FPS:" in line:
+            try:
+                fps = line.split("Detection FPS:")[-1].strip().split(" ")[0]
+            except Exception:
+                pass
+        elif "Lock trigger:" in line:
+            last_trigger = line.split("Lock trigger:")[-1].strip()
+    out = f"State: {state}    FPS: {fps}"
+    if last_trigger:
+        out += f"\nMost recent lock: {last_trigger}"
+    return out
+
+
+def _pid_alive(pid: int) -> bool:
+    """True if `pid` is still a running process. Cheap WMI call."""
+    try:
+        out = subprocess.run(
+            ["tasklist", "/FI", f"PID eq {pid}", "/FO", "CSV", "/NH"],
+            capture_output=True, text=True, timeout=4,
+            creationflags=_CREATE_NO_WINDOW,
+        )
+        return f'"{pid}"' in out.stdout
+    except Exception:
+        return True  # assume alive on failure rather than spamming "exited"
 
 
 if __name__ == "__main__":
