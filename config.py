@@ -132,14 +132,32 @@ STRANGER_LOCK_FRAMES: int = 2
 # clock RESETS on every successful owner match.
 #
 #   ~4s  aggressive -- glance at phone can trigger
-#   ~6s  balanced   -- good default
-#   ~10s lenient    -- you can read a paper for a while without locking
-NO_FACE_LOCK_SECONDS: float = 6.0
+#   ~6s  balanced   -- glance at phone safe; longer reads risky
+#   ~12s lenient    -- you can read a paper for a while without locking
+#   ~20s very lenient -- forgiving of stale face encodings / detection
+#                       hiccups; better default if you keep seeing
+#                       false-locks while sitting at the computer.
+#
+# Bumped to 15s after field reports of repeated false-locks: the daemon
+# would lock, the user would unlock, the post-unlock grace would expire,
+# and the daemon would lock AGAIN within ~10s -- usually because the
+# user's appearance had drifted from the enrollment encoding (lighting,
+# glasses on/off, monitor position) and the matcher was missing them.
+# 15s gives enough headroom that even a multi-second occlusion or a few
+# missed-detection frames don't trigger the time-based lock.
+NO_FACE_LOCK_SECONDS: float = 15.0
 
 # Grace period on startup — don't enforce for the first N seconds after
 # launch. Gives the camera time to warm up and the user time to settle in
 # after login. Also used when returning from LOCKED_SCREEN state.
-STARTUP_GRACE_SECONDS: float = 5.0
+#
+# 8s (was 5s) after observing a relock loop: lock fires -> user unlocks
+# -> daemon enters STARTING -> 5s grace -> WATCHING -> camera/detector
+# is still warming up, fails to find owner -> NO_FACE_LOCK_SECONDS
+# expires -> immediate re-lock. 8s of grace is enough for InsightFace to
+# get into a steady-state detection cycle even after a cold camera
+# reopen.
+STARTUP_GRACE_SECONDS: float = 8.0
 
 # How often to retry opening the camera when it's busy (Zoom, Teams, OBS).
 CAMERA_RETRY_SECONDS: float = 3.0

@@ -84,6 +84,15 @@ class Watcher:
         # back to the end-of-grace time as the baseline.
         self._last_owner_seen: float = 0.0
 
+        # Tag describing the most recent _observe() result -- "no-face",
+        # "sim=0.42", "uncertain sim=0.31", etc. Surfaced in lock-trigger
+        # log lines so the log makes it obvious WHY a lock fired:
+        # "no-face" means the detector saw nothing (occlusion, dark,
+        # camera issue), "sim=0.31" means a face WAS detected but didn't
+        # match the enrolled encoding (drifted appearance, glasses,
+        # bad enrollment) -- the latter strongly suggests re-enrolling.
+        self._last_obs_tag: str = "(none)"
+
         # FPS instrumentation. Every ~5s we log the achieved detection rate
         # so we can tell whether we're hitting FPS_TARGET or bottlenecked on
         # InsightFace. Only counts ticks that actually ran detection.
@@ -266,6 +275,14 @@ class Watcher:
 
         self._maybe_lock()
 
+    def _note_recent_obs(self, tag: str) -> None:
+        """Remember a one-line description of the most recent observation.
+
+        Used purely for diagnostic logging in _maybe_lock(). Cheap --
+        just a string assignment.
+        """
+        self._last_obs_tag = tag
+
     def _check_external_signals(self) -> None:
         """Poll for cross-process IPC markers from a duplicate Vigil launch.
 
@@ -365,9 +382,16 @@ class Watcher:
     def _observe(self, frame_bgr: np.ndarray) -> Observation:
         faces = face_engine.detect_faces(frame_bgr)
         if not faces:
+            self._note_recent_obs("no-face")
             return Observation.EMPTY
 
         best_sim = face_engine.best_similarity(self._known_encoding, faces)
+        # Always remember the most recent similarity for the lock-trigger
+        # log line. When a lock fires, we want the log to show "owner not
+        # seen for 6.9s; recent best similarity 0.31" so it's obvious
+        # whether the trigger was a real you-walked-away or a recognition
+        # miss (drifted appearance vs stale enrollment encoding).
+        self._note_recent_obs(f"sim={best_sim:.2f}")
 
         # Three-way classification, NOT two-way. The naive version was:
         #   sim >= MATCH_THRESHOLD -> OWNER
@@ -390,7 +414,9 @@ class Watcher:
                 "Uncertain face (sim=%.2f, owner>=%.2f stranger<%.2f); treating as EMPTY",
                 best_sim, config.MATCH_THRESHOLD, config.STRANGER_HARD_THRESHOLD,
             )
+            self._note_recent_obs(f"uncertain sim={best_sim:.2f}")
             return Observation.EMPTY
+        self._note_recent_obs(f"stranger sim={best_sim:.2f}")
         return Observation.STRANGER
 
     def _maybe_lock(self) -> None:
@@ -426,8 +452,9 @@ class Watcher:
         gap = time.time() - baseline
         if gap >= config.NO_FACE_LOCK_SECONDS:
             log.warning(
-                "Lock trigger: owner not seen for %.1fs (threshold %.1fs)",
-                gap, config.NO_FACE_LOCK_SECONDS,
+                "Lock trigger: owner not seen for %.1fs (threshold %.1fs); "
+                "most recent observation: %s",
+                gap, config.NO_FACE_LOCK_SECONDS, self._last_obs_tag,
             )
             self._do_lock()
 
